@@ -6,7 +6,11 @@ name: local-server
 
 services:
   postgres:
-    image: postgres:17-alpine
+    # pgvector/pgvector:pg17 = stock PostgreSQL 17 + the `vector` extension preinstalled.
+    # Same PG17 major → existing postgres-data volume is compatible (no dump/restore).
+    # pg_trgm/unaccent ship with contrib here too. Shared upgrade — any project can now
+    # `CREATE EXTENSION vector`; projects that don't use it are unaffected.
+    image: pgvector/pgvector:pg17
     container_name: local-postgres
     restart: unless-stopped
     environment:
@@ -103,12 +107,159 @@ services:
     networks:
       - local-server
 
+  # Microsoft SQL Server — สำหรับ restore legacy backup (.bak) ของลูกค้าก่อน migrate.
+  # Image เป็น amd64 เท่านั้น → บน Apple Silicon รันผ่าน emulation (platform pin ไว้).
+  # /backups mount ชี้ host volume สำหรับ drop ไฟล์ .bak เข้าไป restore (isolate ต่อโปรเจค
+  # ด้วย database แยก ไม่ใช่ instance แยก — ตามกฎ shared services).
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    platform: linux/amd64
+    container_name: local-sqlserver
+    restart: unless-stopped
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:-LocalServer!123}
+      MSSQL_PID: ${MSSQL_PID:-Developer}
+    ports:
+      - "${MSSQL_PORT:-1433}:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+      - ${MSSQL_BACKUP_DIR:-./sqlserver-backups}:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - local-server
+
+  # SonarQube — shared static-analysis server for ALL projects (used by the va-scan skill).
+  # Stores data in the shared postgres (database "sonarqube") — isolate by DB name, not a
+  # separate PG instance (shared-services rule). Web UI on host ${SONARQUBE_PORT:-9009}
+  # because 9000 is already taken by MinIO. ES bootstrap checks disabled for single-node
+  # local dev. The va-scan skill creates the DB + a scan token on first run.
+  sonarqube:
+    image: sonarqube:lts-community
+    container_name: local-sonarqube
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://postgres:5432/${SONARQUBE_DB:-sonarqube}
+      SONAR_JDBC_USERNAME: ${POSTGRES_USER:-postgres}
+      SONAR_JDBC_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    ports:
+      - "${SONARQUBE_PORT:-9009}:9000"
+    volumes:
+      - sonarqube-data:/opt/sonarqube/data
+      - sonarqube-extensions:/opt/sonarqube/extensions
+      - sonarqube-logs:/opt/sonarqube/logs
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      - local-server
+
+  # Oracle Database 19c Enterprise Edition — dev DB for the RAOT/RRF project.
+  # Build จาก context ของ raot-oracle-server/19.3.0 (Oracle Dockerfile + DB home zip
+  # + scripts) แทนการ pull image ที่ registry ไม่มี. build-args เหมือนที่
+  # buildContainerImage.sh ส่งสำหรับ ARM64 EE (BASE_IMAGE=oraclelinux:8,
+  # INSTALL_FILE_1=LINUX.ARM64_1919000_db_home.zip, DB_EDITION=ee) — image arch = arm64
+  # native บนเครื่องนี้ จึงไม่ pin platform. `image:` คงไว้เพื่อ tag ผลลัพธ์ให้ชื่อเดิม.
+  # ต่างจาก container เดิมที่รันแบบ standalone โดยไม่มี volume (data หาย) — ตอนนี้ persist
+  # ที่ named volume oracle-data:/opt/oracle/oradata. PDB ชื่อ rrfdb; หลัง init ครั้งแรก
+  # สร้าง user RRF ตาม README ของ raot-oracle-server.
+  # ต้อง build ก่อนใช้ครั้งแรก: docker compose build oracle  (หรือ up --build)
+  oracle:
+    image: oracle/database:19.3.0-ee
+    build:
+      context: ${ORACLE_BUILD_CONTEXT:-../RAOT/Source-3th/raot-oracle-server/19.3.0}
+      args:
+        BASE_IMAGE: oraclelinux:8
+        INSTALL_FILE_1: LINUX.ARM64_1919000_db_home.zip
+        DB_EDITION: ee
+    container_name: oracle19.3
+    restart: unless-stopped
+    environment:
+      ORACLE_PDB: ${ORACLE_PDB:-rrfdb}
+      ORACLE_PWD: ${ORACLE_PWD:-Manager123}
+      ORACLE_MEM: ${ORACLE_MEM:-3000}
+    ports:
+      - "${ORACLE_PORT:-1521}:1521"
+      - "${ORACLE_EM_PORT:-5500}:5500"
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+    networks:
+      - local-server
+
+  # Mailpit — shared SMTP catch-all for ALL projects (dev email testing). Apps point
+  # their EMAIL_SERVER/SMTP at localhost:1025; nothing leaves the machine. Web inbox
+  # on ${MAILPIT_UI_PORT:-8025}. Isolate per project by From/subject convention, not a
+  # separate instance (shared-services rule). Messages persisted to a named volume.
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: local-mailpit
+    restart: unless-stopped
+    environment:
+      MP_DATABASE: /data/mailpit.db
+      MP_MAX_MESSAGES: ${MAILPIT_MAX_MESSAGES:-5000}
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    ports:
+      - "${MAILPIT_SMTP_PORT:-1025}:1025"
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+    volumes:
+      - mailpit-data:/data
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - local-server
+
+  # 9router — local AI router/proxy (smart multi-provider fallback for coding tools
+  # like Claude Code / Cursor / Cline). Bundles SQLite — ไม่พึ่ง DB ภายนอก. Dashboard +
+  # API ที่ :20128. แต่ละโปรเจค/เครื่องมือชี้ base URL มาที่นี่. INITIAL_PASSWORD ใช้ login
+  # ครั้งแรก (เปลี่ยนใน .env). Data persist ที่ named volume ninerouter-data:/app/data.
+  ninerouter:
+    image: decolua/9router:latest
+    container_name: local-9router
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      INITIAL_PASSWORD: ${NINEROUTER_INITIAL_PASSWORD:-123456}
+      JWT_SECRET: ${NINEROUTER_JWT_SECRET:-change-me-local-dev}
+      NEXT_PUBLIC_BASE_URL: http://localhost:${NINEROUTER_PORT:-20128}
+    ports:
+      - "${NINEROUTER_PORT:-20128}:20128"
+    volumes:
+      - ninerouter-data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:20128',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - local-server
+
 volumes:
   postgres-data:
   mysql-data:
   mongodb-data:
   redis-data:
   minio-data:
+  sqlserver-data:
+  sonarqube-data:
+  sonarqube-extensions:
+  sonarqube-logs:
+  oracle-data:
+  mailpit-data:
+  ninerouter-data:
 
 networks:
   local-server:
