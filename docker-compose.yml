@@ -226,8 +226,11 @@ services:
   # like Claude Code / Cursor / Cline). Bundles SQLite — ไม่พึ่ง DB ภายนอก. Dashboard +
   # API ที่ :20128. แต่ละโปรเจค/เครื่องมือชี้ base URL มาที่นี่. INITIAL_PASSWORD ใช้ login
   # ครั้งแรก (เปลี่ยนใน .env). Data persist ที่ named volume ninerouter-data:/app/data.
+  # Pin เวอร์ชันชัดเจน — tag `:latest` ของ repo นี้เสิร์ฟ manifest ค้าง (pull แล้วขยับ
+  # ทีละ release ไม่ถึงตัวล่าสุด). อัปเดต = เช็ค tag ใหม่แล้วแก้ NINEROUTER_VERSION ใน .env
+  #   curl -s https://registry.npmjs.org/9router/latest | python3 -c 'import sys,json;print(json.load(sys.stdin)["version"])'
   ninerouter:
-    image: decolua/9router:latest
+    image: decolua/9router:${NINEROUTER_VERSION:-0.5.40}
     container_name: local-9router
     restart: unless-stopped
     environment:
